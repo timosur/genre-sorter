@@ -41,6 +41,15 @@ type MoveAction = {
   to_path: string
 }
 
+type ActionEntry = {
+  id: number
+  label: string
+  detail?: string
+  trackPath?: string
+  trackName?: string
+  at: number
+}
+
 const SLOT_COUNT = 9
 
 function App() {
@@ -52,23 +61,15 @@ function App() {
   const [genres, setGenres] = useState<string[]>([])
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [search, setSearch] = useState('')
-  const [targetQuery, setTargetQuery] = useState('')
+  const [newGenreName, setNewGenreName] = useState('')
   const [sortMode, setSortMode] = useState<'name' | 'genre'>('name')
   const [status, setStatus] = useState('Ready')
   const [isLoading, setIsLoading] = useState(true)
   const [isPlaying, setIsPlaying] = useState(false)
-  const [slots, setSlots] = useState<string[]>(() => {
-    const stored = localStorage.getItem('genre-slots')
-    if (!stored) return Array.from({ length: SLOT_COUNT }, () => '')
-    try {
-      const parsed = JSON.parse(stored)
-      if (!Array.isArray(parsed)) return Array.from({ length: SLOT_COUNT }, () => '')
-      return Array.from({ length: SLOT_COUNT }, (_, idx) => parsed[idx] ?? '')
-    } catch {
-      return Array.from({ length: SLOT_COUNT }, () => '')
-    }
-  })
+  const [audioReady, setAudioReady] = useState(false)
   const [undoStack, setUndoStack] = useState<MoveAction[]>([])
+  const [actionLog, setActionLog] = useState<ActionEntry[]>([])
+  const [toast, setToast] = useState<{ id: number; message: string } | null>(null)
 
   const filteredTracks = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -96,41 +97,38 @@ function App() {
   }, [tracks, search, sortMode])
 
   const selectedTrack = filteredTracks[Math.min(selectedIndex, Math.max(filteredTracks.length - 1, 0))]
+  const quickSlots = useMemo(
+    () => [...genres].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })).slice(0, SLOT_COUNT),
+    [genres],
+  )
+  const recentActionByTrack = useMemo(() => {
+    const byPath = new Map<string, ActionEntry>()
+    for (const entry of actionLog) {
+      if (!entry.trackPath) continue
+      if (!byPath.has(entry.trackPath)) {
+        byPath.set(entry.trackPath, entry)
+      }
+    }
+    return byPath
+  }, [actionLog])
 
-  const suggestedGenres = useMemo(() => {
-    const suggestions: string[] = []
-    const tagGenre = selectedTrack?.genre?.trim()
-    if (tagGenre && genres.some((genre) => genre.toLowerCase() === tagGenre.toLowerCase())) {
-      suggestions.push(genres.find((genre) => genre.toLowerCase() === tagGenre.toLowerCase()) ?? tagGenre)
-    }
-    const q = targetQuery.trim().toLowerCase()
-    const fuzzy = genres
-      .filter((genre) => {
-        if (!q) return true
-        const lower = genre.toLowerCase()
-        return lower.includes(q) || lower.startsWith(q)
-      })
-      .slice(0, 12)
-    for (const genre of fuzzy) {
-      if (!suggestions.includes(genre)) suggestions.push(genre)
-    }
-    return suggestions
-  }, [genres, targetQuery, selectedTrack])
+  const selectedTrackBadge = selectedTrack ? recentActionByTrack.get(selectedTrack.path) : undefined
+
+  const appendAction = (entry: Omit<ActionEntry, 'id' | 'at'>) => {
+    setActionLog((current) => [{ ...entry, id: Date.now() + Math.random(), at: Date.now() }, ...current].slice(0, 80))
+  }
+
+  const showToast = (message: string) => {
+    setToast({ id: Date.now() + Math.random(), message })
+  }
+
+  const fileNameFromPath = (path: string) => path.split('/').pop() || path
 
   useEffect(() => {
-    localStorage.setItem('genre-slots', JSON.stringify(slots))
-  }, [slots])
-
-  useEffect(() => {
-    if (genres.length === 0) return
-    if (slots.some((slot) => slot.trim() !== '')) return
-    setSlots((current) =>
-      current.map((slot, idx) => {
-        if (slot) return slot
-        return genres[idx] ?? ''
-      }),
-    )
-  }, [genres])
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(null), 4800)
+    return () => window.clearTimeout(timer)
+  }, [toast?.id])
 
   useEffect(() => {
     const load = async () => {
@@ -153,13 +151,17 @@ function App() {
     if (!waveRef.current || !selectedTrack) {
       wsRef.current?.destroy()
       wsRef.current = null
+      setAudioReady(false)
       return
     }
 
     const src = convertFileSrc(selectedTrack.path)
+    setAudioReady(false)
+    setStatus(`Loading audio: ${selectedTrack.file_name}`)
+
     const ws = WaveSurfer.create({
       container: waveRef.current,
-      height: 116,
+      height: 124,
       waveColor: '#84a59d',
       progressColor: '#f28482',
       cursorColor: '#2f3e46',
@@ -173,14 +175,27 @@ function App() {
     ws.on('play', () => setIsPlaying(true))
     ws.on('pause', () => setIsPlaying(false))
     ws.on('finish', () => setIsPlaying(false))
+    ws.on('ready', () => {
+      setAudioReady(true)
+      setStatus(`Loaded: ${selectedTrack.file_name} (autoplay)`)
+      void Promise.resolve(ws.play()).catch((error) => {
+        setStatus(`Loaded: ${selectedTrack.file_name}. Autoplay blocked: ${String(error)}`)
+      })
+    })
+    ws.on('error', (message) => {
+      setAudioReady(false)
+      setStatus(
+        `Playback failed for ${selectedTrack.file_name}. Check tauri asset protocol scope and file format. ${String(message)}`,
+      )
+    })
 
     wsRef.current = ws
     setIsPlaying(false)
-    setStatus(`Loaded: ${selectedTrack.file_name}`)
 
     return () => {
       ws.destroy()
       wsRef.current = null
+      setAudioReady(false)
     }
   }, [selectedTrack?.path])
 
@@ -206,13 +221,21 @@ function App() {
 
       if (event.key === 'Enter') {
         event.preventDefault()
-        void moveSelected(resolveTargetGenre())
+        const genre = quickSlots[0]
+        if (genre) {
+          void moveSelected(genre)
+        }
+      }
+
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault()
+        void deleteSelected()
       }
 
       const parsed = Number(event.key)
       if (!Number.isNaN(parsed) && parsed >= 1 && parsed <= 9) {
         event.preventDefault()
-        const genre = slots[parsed - 1]
+        const genre = quickSlots[parsed - 1]
         if (genre) {
           void moveSelected(genre)
         }
@@ -226,7 +249,7 @@ function App() {
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [filteredTracks.length, slots, selectedTrack, targetQuery, genres, undoStack])
+  }, [filteredTracks.length, quickSlots, selectedTrack, undoStack])
 
   const refresh = async (rootPath = root) => {
     const result = await invoke<ScanResult>('scan_library', { request: { root: rootPath } })
@@ -234,15 +257,6 @@ function App() {
     setGenres(result.genres)
     setSelectedIndex(0)
     setStatus(`Loaded ${result.tracks.length} tracks from ${result.incoming_path}`)
-  }
-
-  const resolveTargetGenre = () => {
-    const q = targetQuery.trim()
-    if (!q) return suggestedGenres[0] ?? ''
-    const exact = genres.find((genre) => genre.toLowerCase() === q.toLowerCase())
-    if (exact) return exact
-    const fuzzy = genres.find((genre) => genre.toLowerCase().includes(q.toLowerCase()))
-    return fuzzy ?? q
   }
 
   const moveSelected = async (targetGenre: string) => {
@@ -255,9 +269,8 @@ function App() {
 
     try {
       if (!genres.some((entry) => entry.toLowerCase() === genre.toLowerCase())) {
-        const shouldCreate = window.confirm(`Genre "${genre}" existiert nicht. Neu anlegen?`)
-        if (!shouldCreate) return
-        await invoke('create_genre', { request: { root, genre } })
+        setStatus(`Genre does not exist: ${genre}. Use Create Genre first.`)
+        return
       }
 
       const plan = await invoke<MovePlan>('plan_move', {
@@ -287,6 +300,12 @@ function App() {
       })
 
       if (result.status === 'skipped') {
+        appendAction({
+          label: 'Skipped',
+          trackPath: selectedTrack.path,
+          trackName: selectedTrack.file_name,
+        })
+        showToast(`Skipped: ${selectedTrack.file_name}`)
         setStatus(`Skipped: ${selectedTrack.file_name}`)
         return
       }
@@ -296,6 +315,13 @@ function App() {
         setUndoStack((stack) => [{ from_path: movedTo, to_path: selectedTrack.path }, ...stack].slice(0, 100))
       }
 
+      appendAction({
+        label: 'Moved to Genre',
+        detail: genre,
+        trackPath: selectedTrack.path,
+        trackName: selectedTrack.file_name,
+      })
+      showToast(`Moved: ${selectedTrack.file_name} -> ${genre}`)
       setTracks((current) => current.filter((track) => track.path !== selectedTrack.path))
       setStatus(`Moved: ${selectedTrack.file_name} -> ${genre}`)
     } catch (error) {
@@ -310,24 +336,92 @@ function App() {
       return
     }
     try {
+      const restoredName = fileNameFromPath(last.to_path)
       await invoke('undo_move', { request: last })
       setUndoStack(rest)
       await refresh()
+      appendAction({
+        label: 'Undone',
+        detail: 'restored to incoming',
+        trackPath: last.to_path,
+        trackName: restoredName,
+      })
+      showToast(`Undo: ${restoredName}`)
       setStatus('Last move undone.')
     } catch (error) {
       setStatus(String(error))
     }
   }
 
-  const assignSlot = (slotIndex: number) => {
-    const genre = resolveTargetGenre()
-    if (!genre) return
-    setSlots((current) => {
-      const next = [...current]
-      next[slotIndex] = genre
-      return next
-    })
-    setStatus(`Assigned slot ${slotIndex + 1}: ${genre}`)
+  const deleteSelected = async () => {
+    if (!selectedTrack) return
+
+    try {
+      wsRef.current?.pause()
+      wsRef.current?.destroy()
+      wsRef.current = null
+      setIsPlaying(false)
+      setAudioReady(false)
+
+      const dotIndex = selectedTrack.file_name.lastIndexOf('.')
+      const uniqueName =
+        dotIndex > 0
+          ? `${selectedTrack.file_name.slice(0, dotIndex)} (${Date.now()})${selectedTrack.file_name.slice(dotIndex)}`
+          : `${selectedTrack.file_name} (${Date.now()})`
+      const trashTarget = `${root}/_BACKUP_ORGANIZE/_TRASH/${uniqueName}`
+
+      showToast(`Moving to trash: ${selectedTrack.file_name}`)
+      const result = await invoke<{ status: string; moved_to?: string }>('execute_move', {
+        request: {
+          source_path: selectedTrack.path,
+          target_path: trashTarget,
+          rename_candidate: trashTarget,
+          conflict: false,
+        },
+      })
+
+      if (result.status !== 'moved') {
+        throw new Error(`Trash move returned: ${result.status}`)
+      }
+
+      appendAction({
+        label: 'Moved to Trash',
+        detail: result.moved_to || 'via delete action',
+        trackPath: selectedTrack.path,
+        trackName: selectedTrack.file_name,
+      })
+      showToast(`Moved to trash: ${selectedTrack.file_name}`)
+      setTracks((current) => current.filter((track) => track.path !== selectedTrack.path))
+      setStatus(`Moved to trash: ${selectedTrack.file_name}`)
+    } catch (error) {
+      const message = `Delete failed: ${String(error)}`
+      showToast(message)
+      setStatus(message)
+    }
+  }
+
+  const createGenreFromInput = async () => {
+    const genre = newGenreName.trim()
+    if (!genre) {
+      setStatus('Type a new genre name first.')
+      return
+    }
+
+    if (genres.some((entry) => entry.toLowerCase() === genre.toLowerCase())) {
+      setStatus(`Genre already exists: ${genre}`)
+      return
+    }
+
+    try {
+      await invoke('create_genre', { request: { root, genre } })
+      setGenres((current) => [...current, genre].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })))
+      appendAction({ label: 'Genre created', detail: genre })
+      showToast(`Created genre: ${genre}`)
+      setNewGenreName('')
+      setStatus(`Created genre: ${genre}`)
+    } catch (error) {
+      setStatus(String(error))
+    }
   }
 
   const exportXml = async () => {
@@ -390,7 +484,12 @@ function App() {
                 className={idx === selectedIndex ? 'selected' : ''}
                 onClick={() => setSelectedIndex(idx)}
               >
-                <strong>{track.title || track.file_name}</strong>
+                <div className="track-main">
+                  <strong>{track.title || track.file_name}</strong>
+                  {recentActionByTrack.get(track.path) && (
+                    <span className="action-badge">{recentActionByTrack.get(track.path)?.label}</span>
+                  )}
+                </div>
                 <span>{track.artist || 'Unknown Artist'}</span>
                 <span>{track.genre || '-'}</span>
               </li>
@@ -400,12 +499,15 @@ function App() {
 
         <section className="panel player-panel">
           <div className="track-header">
-            <h2>{selectedTrack ? selectedTrack.file_name : 'No track selected'}</h2>
-            <p>Hotkeys: Space play, N/P nav, Enter move, 1-9 slot move</p>
+            <h2>
+              {selectedTrack ? selectedTrack.file_name : 'No track selected'}
+              {selectedTrackBadge && <span className="action-badge">{selectedTrackBadge.label}</span>}
+            </h2>
+            <p>Hotkeys: Space play, N/P nav, 1-9 quick move, Enter move to slot 1, Del trash, Cmd/Ctrl+Z undo</p>
           </div>
           <div ref={waveRef} className="wave" />
           <div className="player-actions">
-            <button type="button" onClick={() => wsRef.current?.playPause()} disabled={!selectedTrack}>
+            <button type="button" onClick={() => wsRef.current?.playPause()} disabled={!selectedTrack || !audioReady}>
               {isPlaying ? 'Pause' : 'Play'}
             </button>
             <button type="button" onClick={() => setSelectedIndex((idx) => Math.max(idx - 1, 0))}>
@@ -420,38 +522,60 @@ function App() {
           </div>
 
           <div className="move-box">
-            <h3>Target Genre</h3>
-            <input
-              value={targetQuery}
-              onChange={(event) => setTargetQuery(event.target.value)}
-              placeholder="Type genre, fuzzy match enabled"
-            />
-            <div className="chips">
-              {suggestedGenres.slice(0, 8).map((genre) => (
-                <button key={genre} type="button" onClick={() => setTargetQuery(genre)}>
-                  {genre}
-                </button>
-              ))}
-            </div>
+            <h3>Quick Move</h3>
             <div className="move-actions">
-              <button type="button" onClick={() => void moveSelected(resolveTargetGenre())} disabled={!selectedTrack}>
-                Move (Enter)
-              </button>
               <button type="button" onClick={() => void undoLastMove()}>
                 Undo (Cmd/Ctrl+Z)
               </button>
+              <button type="button" onClick={() => void deleteSelected()} disabled={!selectedTrack}>
+                Trash (Del)
+              </button>
             </div>
-            <div className="slots">
-              {slots.map((slot, idx) => (
-                <div key={`slot-${idx}`} className="slot">
-                  <button type="button" onClick={() => void moveSelected(slot)} disabled={!slot || !selectedTrack}>
-                    {idx + 1}: {slot || 'Empty'}
-                  </button>
-                  <button type="button" onClick={() => assignSlot(idx)}>
-                    Set
-                  </button>
-                </div>
+            <div className="slot-help">Press 1-9 to move to that genre slot, or click a slot.</div>
+            <div className="slot-grid">
+              {Array.from({ length: SLOT_COUNT }, (_, idx) => quickSlots[idx] ?? '').map((slot, idx) => (
+                <button
+                  key={`slot-${idx}`}
+                  type="button"
+                  className="slot-pill"
+                  onClick={() => void moveSelected(slot)}
+                  disabled={!slot || !selectedTrack}
+                >
+                  <span className="slot-key">{idx + 1}</span>
+                  <span>{slot || 'Unassigned'}</span>
+                </button>
               ))}
+            </div>
+            <div className="new-genre-box">
+              <h4>Add New Genre</h4>
+              <div className="new-genre-row">
+                <input
+                  value={newGenreName}
+                  onChange={(event) => setNewGenreName(event.target.value)}
+                  placeholder="Type new genre name"
+                />
+                <button type="button" onClick={() => void createGenreFromInput()} disabled={!newGenreName.trim()}>
+                  Create
+                </button>
+              </div>
+            </div>
+            <div className="changelog-box">
+              <h4>Recent Actions</h4>
+              {actionLog.length === 0 && <p className="changelog-empty">No actions yet.</p>}
+              {actionLog.length > 0 && (
+                <ul className="changelog-list">
+                  {actionLog.slice(0, 8).map((entry) => (
+                    <li key={entry.id}>
+                      <span className="log-label">{entry.label}</span>
+                      <span className="log-main">
+                        {entry.trackName && entry.detail
+                          ? `${entry.trackName} (${entry.detail})`
+                          : entry.trackName || entry.detail || '-'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </div>
         </section>
@@ -492,6 +616,7 @@ function App() {
         </aside>
       </section>
       <footer className="status">{status}</footer>
+      {toast && <div className="toast">{toast.message}</div>}
     </main>
   )
 }

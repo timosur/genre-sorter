@@ -1,7 +1,10 @@
 :root {
-  font-family: "Avenir Next", "Helvetica Neue", Helvetica, sans-serif;
-  color: #14213d;
-  background: radial-gradient(circle at 10% 0%, #fefae0 0%, #f6f7fb 45%, #e9f5ef 100%);
+  font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+  color: #f2f5f8;
+  background:
+    radial-gradient(circle at 8% 2%, rgba(255, 138, 91, 0.22) 0%, rgba(255, 138, 91, 0) 40%),
+    radial-gradient(circle at 88% 6%, rgba(111, 206, 255, 0.18) 0%, rgba(111, 206, 255, 0) 42%),
+    linear-gradient(165deg, #081220 0%, #0f1f33 50%, #12253d 100%);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -13,6 +16,10 @@ body,
 #root {
   margin: 0;
   min-height: 100vh;
+}
+
+body {
+  background: transparent;
 }
 
 code {

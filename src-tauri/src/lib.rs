@@ -1,15 +1,18 @@
-use lofty::file::TaggedFileExt;
-use lofty::prelude::{Accessor, ItemKey, Probe};
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::prelude::{Accessor, ItemKey};
+use lofty::probe::Probe;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 use chrono::{Datelike, Local, TimeZone};
 
 const INCOMING_CANDIDATES: [&str; 2] = ["00 New", "00_NEW_IN"];
-const SKIP_TOP_LEVEL: [&str; 5] = ["00 New", "00_NEW_IN", "_REKORDBOX_M3U", "_BACKUP_ORGANIZE", "genre-sorter"];
+const SKIP_TOP_LEVEL: [&str; 6] = ["00 New", "00_NEW_IN", "01 App", "_REKORDBOX_M3U", "_BACKUP_ORGANIZE", "genre-sorter"];
 const MEDIA_EXTENSIONS: [&str; 6] = ["mp3", "m4a", "wav", "aiff", "flac", "ogg"];
 
 #[derive(Serialize)]
@@ -103,6 +106,18 @@ struct MoveResult {
 struct UndoMoveRequest {
     from_path: String,
     to_path: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteTrackRequest {
+    root: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct DeleteTrackResult {
+    status: String,
+    moved_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +282,60 @@ fn undo_move(request: UndoMoveRequest) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::rename(from, to).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_track(request: DeleteTrackRequest) -> Result<DeleteTrackResult, String> {
+    let root = PathBuf::from(&request.root);
+    let path = PathBuf::from(&request.path);
+    if !path.exists() {
+        return Err("File no longer exists.".to_string());
+    }
+    if !path.is_file() {
+        return Err("Path is not a file.".to_string());
+    }
+
+    let mut last_error = String::new();
+    for attempt in 0..6 {
+        match fs::remove_file(&path) {
+            Ok(_) => {
+                return Ok(DeleteTrackResult {
+                    status: "deleted".to_string(),
+                    moved_to: None,
+                })
+            }
+            Err(err) => {
+                last_error = err.to_string();
+                if err.kind() != ErrorKind::PermissionDenied && err.kind() != ErrorKind::Other {
+                    break;
+                }
+
+                if attempt < 5 {
+                    thread::sleep(std::time::Duration::from_millis(120));
+                }
+            }
+        }
+    }
+
+    let trash_dir = root.join("_BACKUP_ORGANIZE").join("_TRASH");
+    fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "Invalid file name for delete operation.".to_string())?;
+    let trash_target = unique_candidate(&trash_dir.join(file_name));
+
+    match fs::rename(&path, &trash_target) {
+        Ok(_) => Ok(DeleteTrackResult {
+            status: "trashed".to_string(),
+            moved_to: Some(trash_target.to_string_lossy().to_string()),
+        }),
+        Err(trash_error) => Err(format!(
+            "Could not delete file '{}': {}. Also failed to move to trash: {}",
+            path.to_string_lossy(),
+            last_error,
+            trash_error
+        )),
+    }
 }
 
 #[tauri::command]
@@ -439,9 +508,16 @@ fn discover_genres(root: &Path) -> Result<Vec<String>, String> {
         if name.starts_with('_') {
             continue;
         }
+        if is_app_workspace_dir(&path) {
+            continue;
+        }
         genres.push(name);
     }
     Ok(genres)
+}
+
+fn is_app_workspace_dir(path: &Path) -> bool {
+    path.join("src-tauri").is_dir()
 }
 
 fn track_info_from_path(path: &Path) -> TrackInfo {
@@ -515,7 +591,12 @@ fn track_info_from_path(path: &Path) -> TrackInfo {
 
             for item in tag.items() {
                 let key = format!("{:?}", item.key());
-                let value = item.value().to_string();
+                let value = item
+                    .value()
+                    .text()
+                    .or_else(|| item.value().locator())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
                 if value.trim().is_empty() {
                     continue;
                 }
@@ -618,6 +699,7 @@ pub fn run() {
             plan_move,
             execute_move,
             undo_move,
+            delete_track,
             export_rekordbox_xml
         ])
         .run(tauri::generate_context!())
