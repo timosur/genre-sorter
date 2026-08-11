@@ -1,0 +1,20 @@
+:root {
+  font-family: "Avenir Next", "Helvetica Neue", Helvetica, sans-serif;
+  color: #14213d;
+  background: radial-gradient(circle at 10% 0%, #fefae0 0%, #f6f7fb 45%, #e9f5ef 100%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100vh;
+}
+
+code {
+  font-family: "SF Mono", Menlo, monospace;
+}
