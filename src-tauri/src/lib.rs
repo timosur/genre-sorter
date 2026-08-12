@@ -136,13 +136,13 @@ struct ExportXmlResult {
 
 #[tauri::command]
 fn detect_library_root() -> Result<LibraryRoot, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let mut candidates = vec![cwd.clone()];
-    if let Some(parent) = cwd.parent() {
-        candidates.push(parent.to_path_buf());
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.extend(cwd.ancestors().map(Path::to_path_buf));
     }
-    if let Some(parent) = cwd.parent().and_then(|p| p.parent()) {
-        candidates.push(parent.to_path_buf());
+    // Bundled macOS apps do not inherit the project directory as their CWD.
+    if let Ok(executable) = std::env::current_exe() {
+        candidates.extend(executable.ancestors().map(Path::to_path_buf));
     }
 
     for candidate in candidates {
