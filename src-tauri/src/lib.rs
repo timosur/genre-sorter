@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 use chrono::{Datelike, Local, TimeZone};
 
 const INCOMING_CANDIDATES: [&str; 2] = ["00 New", "00_NEW_IN"];
-const SKIP_TOP_LEVEL: [&str; 6] = ["00 New", "00_NEW_IN", "01 App", "_REKORDBOX_M3U", "_BACKUP_ORGANIZE", "genre-sorter"];
+const SKIP_TOP_LEVEL: [&str; 7] = ["00 New", "00_NEW_IN", "01 App", "Genre Sorter.app", "_REKORDBOX_M3U", "_BACKUP_ORGANIZE", "genre-sorter"];
 const MEDIA_EXTENSIONS: [&str; 6] = ["mp3", "m4a", "wav", "aiff", "flac", "ogg"];
 
 #[derive(Serialize)]
@@ -133,6 +133,9 @@ struct ExportXmlResult {
     track_count: usize,
     output_path: String,
 }
+
+type Playlist = (String, String, Vec<usize>);
+type GenrePlaylists = (String, Vec<(String, Vec<usize>)>);
 
 #[tauri::command]
 fn detect_library_root() -> Result<LibraryRoot, String> {
@@ -344,7 +347,7 @@ fn export_rekordbox_xml(request: ExportXmlRequest) -> Result<ExportXmlResult, St
     let mut genres = discover_genres(&root)?;
     genres.sort();
 
-    let mut known_tracks: Vec<String> = Vec::new();
+    let mut known_tracks: Vec<TrackInfo> = Vec::new();
     let mut playlists: Vec<(String, String, Vec<usize>)> = Vec::new();
 
     for genre in &genres {
@@ -375,11 +378,11 @@ fn export_rekordbox_xml(request: ExportXmlRequest) -> Result<ExportXmlResult, St
                 .filter(|entry| entry.file_type().is_file())
                 .filter(|entry| is_supported_media(entry.path()))
             {
-                let path = entry.path().to_string_lossy().to_string();
-                let id = if let Some(pos) = known_tracks.iter().position(|v| v == &path) {
+                let track = track_info_from_path(entry.path());
+                let id = if let Some(pos) = known_tracks.iter().position(|v| v.path == track.path) {
                     pos + 1
                 } else {
-                    known_tracks.push(path);
+                    known_tracks.push(track);
                     known_tracks.len()
                 };
                 track_ids.push(id);
@@ -407,7 +410,7 @@ fn export_rekordbox_xml(request: ExportXmlRequest) -> Result<ExportXmlResult, St
     })
 }
 
-fn build_rekordbox_xml(known_tracks: &[String], playlists: &[(String, String, Vec<usize>)]) -> String {
+fn build_rekordbox_xml(known_tracks: &[TrackInfo], playlists: &[Playlist]) -> String {
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     output.push_str("<DJ_PLAYLISTS Version=\"1.0.0\">\n");
@@ -416,17 +419,36 @@ fn build_rekordbox_xml(known_tracks: &[String], playlists: &[(String, String, Ve
     output.push_str(&known_tracks.len().to_string());
     output.push_str("\">\n");
 
-    for (idx, path) in known_tracks.iter().enumerate() {
-        let location = format!("file://localhost{}", escape_xml(path));
+    for (idx, track) in known_tracks.iter().enumerate() {
+        let location = format!("file://localhost{}", escape_xml(&track.path));
         output.push_str("    <TRACK TrackID=\"");
         output.push_str(&(idx + 1).to_string());
         output.push_str("\" Name=\"");
-        let name = Path::new(path)
-            .file_stem()
-            .map(|v| v.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-        output.push_str(&escape_xml(&name));
-        output.push_str("\" Location=\"");
+        let name = track.title.as_deref().unwrap_or_else(|| {
+            track
+                .file_name
+                .strip_suffix(&format!(".{}", track.extension))
+                .unwrap_or(&track.file_name)
+        });
+        output.push_str(&escape_xml(name));
+        output.push('"');
+        for (attribute, value) in [
+            ("Artist", track.artist.as_deref()),
+            ("Album", track.album.as_deref()),
+            ("Genre", track.genre.as_deref()),
+            ("Year", track.year.as_deref()),
+            ("AverageBpm", track.bpm.as_deref()),
+            ("Tonality", track.musical_key.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                output.push(' ');
+                output.push_str(attribute);
+                output.push_str("=\"");
+                output.push_str(&escape_xml(value));
+                output.push('"');
+            }
+        }
+        output.push_str(" Location=\"");
         output.push_str(&location);
         output.push_str("\"/>\n");
     }
@@ -443,7 +465,7 @@ fn build_rekordbox_xml(known_tracks: &[String], playlists: &[(String, String, Ve
     output.push_str(&genre_count.to_string());
     output.push_str("\">\n");
 
-    let mut by_genre: Vec<(String, Vec<(String, Vec<usize>)>)> = Vec::new();
+    let mut by_genre: Vec<GenrePlaylists> = Vec::new();
     for (genre, year, ids) in playlists {
         if let Some((_, existing)) = by_genre.iter_mut().find(|(g, _)| g == genre) {
             existing.push((year.clone(), ids.clone()));
@@ -704,4 +726,54 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rekordbox_xml_includes_embedded_track_metadata() {
+        let tracks = vec![TrackInfo {
+            path: "/Music/Artist - Track.mp3".to_string(),
+            file_name: "Artist - Track.mp3".to_string(),
+            extension: "mp3".to_string(),
+            size_bytes: 0,
+            created_epoch: 0,
+            modified_epoch: 0,
+            duration_seconds: None,
+            title: Some("Track".to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some("Album".to_string()),
+            genre: Some("House".to_string()),
+            year: Some("2026".to_string()),
+            bpm: Some("128".to_string()),
+            musical_key: Some("8A".to_string()),
+            tags: Vec::new(),
+        }];
+
+        let xml = build_rekordbox_xml(
+            &tracks,
+            &[("House".to_string(), "2026".to_string(), vec![1])],
+        );
+
+        assert!(xml.contains("Name=\"Track\""));
+        assert!(xml.contains("Artist=\"Artist\""));
+        assert!(xml.contains("Album=\"Album\""));
+        assert!(xml.contains("Genre=\"House\""));
+        assert!(xml.contains("Year=\"2026\""));
+        assert!(xml.contains("AverageBpm=\"128\""));
+        assert!(xml.contains("Tonality=\"8A\""));
+    }
+
+    #[test]
+    fn genre_sorter_bundle_is_not_a_genre() {
+        let root = std::env::temp_dir().join(format!("genre-sorter-test-{}", std::process::id()));
+        fs::create_dir_all(root.join("Genre Sorter.app")).unwrap();
+        fs::create_dir_all(root.join("Techno")).unwrap();
+
+        assert_eq!(discover_genres(&root).unwrap(), vec!["Techno"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
