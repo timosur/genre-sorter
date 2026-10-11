@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import WaveSurfer from 'wavesurfer.js'
 import './App.css'
@@ -13,6 +14,7 @@ type TrackInfo = {
   created_epoch: number
   modified_epoch: number
   duration_seconds?: number
+  bitrate_kbps?: number
   title?: string
   artist?: string
   album?: string
@@ -36,6 +38,13 @@ type MovePlan = {
   conflict: boolean
 }
 
+type ReleaseMatch = {
+  title: string
+  artist: string
+  year: string
+  score: string
+}
+
 type MoveAction = {
   from_path: string
   to_path: string
@@ -52,6 +61,12 @@ type ActionEntry = {
 
 const SLOT_COUNT = 9
 
+function formatDuration(seconds?: number) {
+  if (!seconds || seconds < 0) return '-'
+  const total = Math.round(seconds)
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
+}
+
 function App() {
   const waveRef = useRef<HTMLDivElement | null>(null)
   const wsRef = useRef<WaveSurfer | null>(null)
@@ -62,7 +77,7 @@ function App() {
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [search, setSearch] = useState('')
   const [newGenreName, setNewGenreName] = useState('')
-  const [sortMode, setSortMode] = useState<'name' | 'genre'>('name')
+  const [sortMode, setSortMode] = useState<'name' | 'genre' | 'created' | 'modified'>('name')
   const [status, setStatus] = useState('Ready')
   const [isLoading, setIsLoading] = useState(true)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -70,6 +85,9 @@ function App() {
   const [undoStack, setUndoStack] = useState<MoveAction[]>([])
   const [actionLog, setActionLog] = useState<ActionEntry[]>([])
   const [toast, setToast] = useState<{ id: number; message: string } | null>(null)
+  const [releaseMatches, setReleaseMatches] = useState<ReleaseMatch[]>([])
+  const [manualMoveYear, setManualMoveYear] = useState<string | undefined>()
+  const [isLookingUpRelease, setIsLookingUpRelease] = useState(false)
 
   const filteredTracks = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -92,6 +110,8 @@ function App() {
       if (sortMode === 'genre') {
         return (a.genre ?? '').localeCompare(b.genre ?? '') || a.file_name.localeCompare(b.file_name)
       }
+      if (sortMode === 'created') return b.created_epoch - a.created_epoch || a.file_name.localeCompare(b.file_name)
+      if (sortMode === 'modified') return b.modified_epoch - a.modified_epoch || a.file_name.localeCompare(b.file_name)
       return a.file_name.localeCompare(b.file_name)
     })
   }, [tracks, search, sortMode])
@@ -113,6 +133,8 @@ function App() {
   }, [actionLog])
 
   const selectedTrackBadge = selectedTrack ? recentActionByTrack.get(selectedTrack.path) : undefined
+  const tagYear = selectedTrack?.year && /^\d{4}$/.test(selectedTrack.year) ? selectedTrack.year : undefined
+  const moveYear = tagYear || (manualMoveYear && /^\d{4}$/.test(manualMoveYear) ? manualMoveYear : undefined)
 
   const appendAction = (entry: Omit<ActionEntry, 'id' | 'at'>) => {
     setActionLog((current) => [{ ...entry, id: Date.now() + Math.random(), at: Date.now() }, ...current].slice(0, 80))
@@ -200,6 +222,11 @@ function App() {
   }, [selectedTrack?.path])
 
   useEffect(() => {
+    setReleaseMatches([])
+    setManualMoveYear(undefined)
+  }, [selectedTrack?.path])
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const tag = (event.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA') return
@@ -249,7 +276,7 @@ function App() {
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [filteredTracks.length, quickSlots, selectedTrack, undoStack])
+  }, [filteredTracks.length, quickSlots, selectedTrack, undoStack, moveYear])
 
   const refresh = async (rootPath = root) => {
     const result = await invoke<ScanResult>('scan_library', { request: { root: rootPath } })
@@ -266,6 +293,10 @@ function App() {
       setStatus('Choose a target genre first.')
       return
     }
+    if (!moveYear) {
+      setStatus('A four-digit move year is required to move this track.')
+      return
+    }
 
     try {
       if (!genres.some((entry) => entry.toLowerCase() === genre.toLowerCase())) {
@@ -274,7 +305,12 @@ function App() {
       }
 
       const plan = await invoke<MovePlan>('plan_move', {
-        request: { root, source_path: selectedTrack.path, target_genre: genre },
+        request: {
+          root,
+          source_path: selectedTrack.path,
+          target_genre: genre,
+          year: moveYear,
+        },
       })
 
       let decision: 'skip' | 'overwrite' | 'rename' | undefined
@@ -326,6 +362,27 @@ function App() {
       setStatus(`Moved: ${selectedTrack.file_name} -> ${genre}`)
     } catch (error) {
       setStatus(String(error))
+    }
+  }
+
+  const lookupReleaseYear = async () => {
+    if (!selectedTrack) return
+    try {
+      setIsLookingUpRelease(true)
+      setReleaseMatches([])
+      const matches = await invoke<ReleaseMatch[]>('lookup_release_year', {
+        request: { artist: selectedTrack.artist || '', title: selectedTrack.title || '' },
+      })
+      setReleaseMatches(matches)
+      if (!matches.length) {
+        const query = `${selectedTrack.artist || 'Unknown artist'} - ${selectedTrack.title || selectedTrack.file_name} release year`
+        await openUrl(`https://www.google.com/search?q=${encodeURIComponent(query)}`)
+      }
+      setStatus(matches.length ? `Found ${matches.length} MusicBrainz matches. Choose one.` : 'No dated MusicBrainz matches found. Opened Google search.')
+    } catch (error) {
+      setStatus(`Release lookup failed: ${String(error)}`)
+    } finally {
+      setIsLookingUpRelease(false)
     }
   }
 
@@ -382,6 +439,10 @@ function App() {
 
       if (result.status !== 'moved') {
         throw new Error(`Trash move returned: ${result.status}`)
+      }
+      const movedTo = result.moved_to
+      if (movedTo) {
+        setUndoStack((stack) => [{ from_path: movedTo, to_path: selectedTrack.path }, ...stack].slice(0, 100))
       }
 
       appendAction({
@@ -471,9 +532,11 @@ function App() {
               }}
               placeholder="Filter tracks (name/tag)"
             />
-            <select value={sortMode} onChange={(event) => setSortMode(event.target.value as 'name' | 'genre')}>
+            <select value={sortMode} onChange={(event) => setSortMode(event.target.value as typeof sortMode)}>
               <option value="name">Sort: Name</option>
               <option value="genre">Sort: Genre</option>
+              <option value="created">Sort: Created (newest)</option>
+              <option value="modified">Sort: Modified (newest)</option>
             </select>
           </div>
           <div className="count">Queue: {filteredTracks.length}</div>
@@ -491,7 +554,7 @@ function App() {
                   )}
                 </div>
                 <span>{track.artist || 'Unknown Artist'}</span>
-                <span>{track.genre || '-'}</span>
+                <span>{track.genre || '-'} · {formatDuration(track.duration_seconds)} · {track.bitrate_kbps ? `${track.bitrate_kbps} kbps` : '-'}</span>
               </li>
             ))}
           </ul>
@@ -539,7 +602,7 @@ function App() {
                   type="button"
                   className="slot-pill"
                   onClick={() => void moveSelected(slot)}
-                  disabled={!slot || !selectedTrack}
+                  disabled={!slot || !selectedTrack || !moveYear}
                 >
                   <span className="slot-key">{idx + 1}</span>
                   <span>{slot || 'Unassigned'}</span>
@@ -598,11 +661,47 @@ function App() {
                 <div>{selectedTrack.bpm || '-'}</div>
                 <div>Key</div>
                 <div>{selectedTrack.musical_key || '-'}</div>
+                <div>Length</div>
+                <div>{formatDuration(selectedTrack.duration_seconds)}</div>
+                <div>Bitrate</div>
+                <div>{selectedTrack.bitrate_kbps ? `${selectedTrack.bitrate_kbps} kbps` : '-'}</div>
                 <div>Tag Year</div>
                 <div>{selectedTrack.year || '-'}</div>
+                <div>Move Year</div>
+                {tagYear ? (
+                  <div>{tagYear} (tag)</div>
+                ) : (
+                  <input
+                    aria-label="Move year"
+                    inputMode="numeric"
+                    maxLength={4}
+                    placeholder="YYYY"
+                    value={manualMoveYear ?? ''}
+                    onChange={(event) => {
+                      const year = event.target.value
+                      if (/^\d{0,4}$/.test(year)) setManualMoveYear(year || undefined)
+                    }}
+                  />
+                )}
                 <div>File</div>
                 <div>{selectedTrack.path}</div>
               </div>
+              {!tagYear && (
+                <div className="release-lookup">
+                  <button type="button" onClick={() => void lookupReleaseYear()} disabled={isLookingUpRelease}>
+                    {isLookingUpRelease ? 'Looking up…' : 'Find Release Year'}
+                  </button>
+                  {releaseMatches.map((match) => (
+                    <button
+                      key={`${match.year}-${match.artist}-${match.title}`}
+                      type="button"
+                      onClick={() => setManualMoveYear(match.year)}
+                    >
+                      {match.year} — {match.artist || 'Unknown artist'} — {match.title} {match.score && `(${match.score}%)`}
+                    </button>
+                  ))}
+                </div>
+              )}
               <h4>All Tag Fields ({selectedTrack.tags.length})</h4>
               <ul className="tag-list">
                 {selectedTrack.tags.map((tag) => (

@@ -13,7 +13,8 @@
     "export:app": "tauri build --bundles app && rm -rf \"../Genre Sorter.app\" && ditto \"src-tauri/target/release/bundle/macos/Genre Sorter.app\" \"../Genre Sorter.app\""
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-opener": "2.5.5",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "wavesurfer.js": "^7.12.11"

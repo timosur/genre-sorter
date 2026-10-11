@@ -2,6 +2,7 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::{Accessor, ItemKey};
 use lofty::probe::Probe;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
@@ -9,10 +10,17 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
-use chrono::{Datelike, Local, TimeZone};
 
 const INCOMING_CANDIDATES: [&str; 2] = ["00 New", "00_NEW_IN"];
-const SKIP_TOP_LEVEL: [&str; 7] = ["00 New", "00_NEW_IN", "01 App", "Genre Sorter.app", "_REKORDBOX_M3U", "_BACKUP_ORGANIZE", "genre-sorter"];
+const SKIP_TOP_LEVEL: [&str; 7] = [
+    "00 New",
+    "00_NEW_IN",
+    "01 App",
+    "Genre Sorter.app",
+    "_REKORDBOX_M3U",
+    "_BACKUP_ORGANIZE",
+    "genre-sorter",
+];
 const MEDIA_EXTENSIONS: [&str; 6] = ["mp3", "m4a", "wav", "aiff", "flac", "ogg"];
 
 #[derive(Serialize)]
@@ -36,6 +44,7 @@ struct TrackInfo {
     created_epoch: i64,
     modified_epoch: i64,
     duration_seconds: Option<f64>,
+    bitrate_kbps: Option<u32>,
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
@@ -69,6 +78,21 @@ struct MovePlanRequest {
     root: String,
     source_path: String,
     target_genre: String,
+    year: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseLookupRequest {
+    artist: String,
+    title: String,
+}
+
+#[derive(Serialize)]
+struct ReleaseMatch {
+    title: String,
+    artist: String,
+    year: String,
+    score: String,
 }
 
 #[derive(Serialize)]
@@ -164,7 +188,10 @@ fn detect_library_root() -> Result<LibraryRoot, String> {
         }
     }
 
-    Err("No library root detected. Place the app inside your music library or choose a valid root.".to_string())
+    Err(
+        "No library root detected. Place the app inside your music library or choose a valid root."
+            .to_string(),
+    )
 }
 
 #[tauri::command]
@@ -213,7 +240,10 @@ fn plan_move(request: MovePlanRequest) -> Result<MovePlan, String> {
         return Err("Choose a target genre first.".to_string());
     }
 
-    let year = file_year(&source_path)?;
+    let year = request.year.trim();
+    if !is_valid_year(year) {
+        return Err("Move year is required and must be four digits.".to_string());
+    }
     let file_name = source_path
         .file_name()
         .map(|v| v.to_string_lossy().to_string())
@@ -230,6 +260,94 @@ fn plan_move(request: MovePlanRequest) -> Result<MovePlan, String> {
         rename_candidate: rename_candidate.to_string_lossy().to_string(),
         conflict,
     })
+}
+
+#[tauri::command]
+fn lookup_release_year(request: ReleaseLookupRequest) -> Result<Vec<ReleaseMatch>, String> {
+    let artist = request.artist.trim();
+    let title = request.title.trim();
+    if artist.is_empty() || title.is_empty() {
+        return Err("MusicBrainz lookup needs both artist and title tags.".to_string());
+    }
+
+    let query = format!(
+        "recording:\"{}\" AND artist:\"{}\"",
+        escape_lucene(title),
+        escape_lucene(artist)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("GenreSorter/0.1.0 (personal music library organizer)")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut response = musicbrainz_search(&client, query)?;
+
+    let base_title = title.split('(').next().unwrap_or(title).trim();
+    if base_title != title
+        && response["recordings"]
+            .as_array()
+            .map(|recordings| recordings.is_empty())
+            .unwrap_or(true)
+    {
+        thread::sleep(std::time::Duration::from_secs(1));
+        response = musicbrainz_search(
+            &client,
+            format!(
+                "recording:\"{}\" AND artist:\"{}\"",
+                escape_lucene(base_title),
+                escape_lucene(artist)
+            ),
+        )?;
+    }
+
+    Ok(response["recordings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|recording| {
+            let year = recording["first-release-date"].as_str()?.get(..4)?;
+            is_valid_year(year).then(|| ReleaseMatch {
+                title: recording["title"].as_str().unwrap_or_default().to_string(),
+                artist: recording["artist-credit"]
+                    .as_array()
+                    .and_then(|artists| artists.first())
+                    .and_then(|artist| artist["name"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                year: year.to_string(),
+                score: recording["score"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        .collect())
+}
+
+fn musicbrainz_search(client: &reqwest::blocking::Client, query: String) -> Result<Value, String> {
+    for attempt in 0..2 {
+        let response = client
+            .get("https://musicbrainz.org/ws/2/recording")
+            .query(&[
+                ("query", query.clone()),
+                ("fmt", "json".to_string()),
+                ("limit", "5".to_string()),
+            ])
+            .send()
+            .map_err(|e| format!("MusicBrainz request failed: {e}"))?;
+
+        if attempt == 0
+            && (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        {
+            thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        }
+
+        return response
+            .error_for_status()
+            .map_err(|e| format!("MusicBrainz request failed: {e}"))?
+            .json()
+            .map_err(|e| format!("Could not read MusicBrainz response: {e}"));
+    }
+    unreachable!()
 }
 
 #[tauri::command]
@@ -264,7 +382,7 @@ fn execute_move(request: ExecuteMoveRequest) -> Result<MoveResult, String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    fs::rename(&source_path, &final_target).map_err(|e| e.to_string())?;
+    rename_with_retry(&source_path, &final_target).map_err(|e| e.to_string())?;
     Ok(MoveResult {
         status: "moved".to_string(),
         moved_to: Some(final_target.to_string_lossy().to_string()),
@@ -284,7 +402,23 @@ fn undo_move(request: UndoMoveRequest) -> Result<(), String> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::rename(from, to).map_err(|e| e.to_string())
+    rename_with_retry(&from, &to).map_err(|e| e.to_string())
+}
+
+fn rename_with_retry(source: &Path, target: &Path) -> std::io::Result<()> {
+    for attempt in 0..6 {
+        match fs::rename(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < 5
+                    && matches!(error.kind(), ErrorKind::PermissionDenied | ErrorKind::Other) =>
+            {
+                thread::sleep(std::time::Duration::from_millis(120));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 #[tauri::command]
@@ -474,7 +608,8 @@ fn build_rekordbox_xml(known_tracks: &[TrackInfo], playlists: &[Playlist]) -> St
         }
     }
 
-    for (genre, year_playlists) in by_genre {
+    for (genre, mut year_playlists) in by_genre {
+        year_playlists.sort_by(|(left, _), (right, _)| left.cmp(right));
         output.push_str("      <NODE Type=\"0\" Name=\"");
         output.push_str(&escape_xml(&genre));
         output.push_str("\" Count=\"");
@@ -574,6 +709,7 @@ fn track_info_from_path(path: &Path) -> TrackInfo {
         created_epoch,
         modified_epoch,
         duration_seconds: None,
+        bitrate_kbps: None,
         title: None,
         artist: None,
         album: None,
@@ -586,6 +722,8 @@ fn track_info_from_path(path: &Path) -> TrackInfo {
 
     if let Ok(tagged_file) = Probe::open(path).and_then(|probe| probe.read()) {
         info.duration_seconds = Some(tagged_file.properties().duration().as_secs_f64());
+        info.bitrate_kbps = tagged_file.properties().audio_bitrate();
+        let mut seen_tags = HashSet::new();
 
         for tag in tagged_file.tags() {
             if info.title.is_none() {
@@ -622,7 +760,9 @@ fn track_info_from_path(path: &Path) -> TrackInfo {
                 if value.trim().is_empty() {
                     continue;
                 }
-                info.tags.push(TagField { key, value });
+                if seen_tags.insert((key.clone(), value.clone())) {
+                    info.tags.push(TagField { key, value });
+                }
             }
         }
     }
@@ -630,20 +770,19 @@ fn track_info_from_path(path: &Path) -> TrackInfo {
     info
 }
 
-fn file_year(path: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
-    let ts = metadata
-        .created()
-        .ok()
-        .or_else(|| metadata.modified().ok())
-        .and_then(systemtime_to_epoch)
-        .ok_or_else(|| "Could not read file timestamp.".to_string())?;
+fn is_valid_year(value: &str) -> bool {
+    value.len() == 4 && value.chars().all(|ch| ch.is_ascii_digit())
+}
 
-    let dt = Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .ok_or_else(|| "Invalid timestamp".to_string())?;
-    Ok(dt.year().to_string())
+fn escape_lucene(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if "+-&|!(){}[]^\"~*?:\\/".contains(ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn unique_candidate(target_path: &Path) -> PathBuf {
@@ -698,12 +837,15 @@ fn escape_xml(input: &str) -> String {
 }
 
 fn systemtime_to_epoch(ts: SystemTime) -> Option<i64> {
-    ts.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+    ts.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -719,6 +861,7 @@ pub fn run() {
             scan_library,
             create_genre,
             plan_move,
+            lookup_release_year,
             execute_move,
             undo_move,
             delete_track,
@@ -742,6 +885,7 @@ mod tests {
             created_epoch: 0,
             modified_epoch: 0,
             duration_seconds: None,
+            bitrate_kbps: None,
             title: Some("Track".to_string()),
             artist: Some("Artist".to_string()),
             album: Some("Album".to_string()),
@@ -767,6 +911,19 @@ mod tests {
     }
 
     #[test]
+    fn rekordbox_xml_orders_year_playlists_ascending() {
+        let xml = build_rekordbox_xml(
+            &[],
+            &[
+                ("House".to_string(), "2024".to_string(), vec![2]),
+                ("House".to_string(), "1999".to_string(), vec![1]),
+            ],
+        );
+
+        assert!(xml.find("Name=\"1999\"").unwrap() < xml.find("Name=\"2024\"").unwrap());
+    }
+
+    #[test]
     fn genre_sorter_bundle_is_not_a_genre() {
         let root = std::env::temp_dir().join(format!("genre-sorter-test-{}", std::process::id()));
         fs::create_dir_all(root.join("Genre Sorter.app")).unwrap();
@@ -775,5 +932,19 @@ mod tests {
         assert_eq!(discover_genres(&root).unwrap(), vec!["Techno"]);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_year_must_be_four_digits() {
+        assert!(is_valid_year("1999"));
+        assert!(!is_valid_year("2024-01-01"));
+    }
+
+    #[test]
+    fn lookup_falls_back_from_mix_title() {
+        assert_eq!(
+            "My Friends",
+            "My Friends (Radio Edit)".split('(').next().unwrap().trim()
+        );
     }
 }
